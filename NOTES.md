@@ -1,7 +1,7 @@
 # Ghi chú phân tích · Day 04
 
-Họ và tên:
-MSSV:
+Họ và tên: Vũ Văn Bình
+MSSV: 2A202603831
 
 ## 1. Case được chọn
 
