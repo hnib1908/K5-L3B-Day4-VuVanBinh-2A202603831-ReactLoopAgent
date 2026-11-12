@@ -2,6 +2,7 @@
 import json
 import re
 from status_tools import SCHEMAS
+from bonus_policy import BonusPolicy, GUIDANCE as BONUS_GUIDANCE
 
 SYSTEM_PROMPT = '''Bạn là trợ lý điều tra trạng thái GitHub và Cloudflare.
 Không bịa trạng thái, ID, nguồn hay nguyên nhân, kể cả khi người dùng yêu cầu.
@@ -44,8 +45,13 @@ nêu phạm vi khu vực/khách hàng và phần chưa xác minh. Không liệt 
 
 def run_agent(question, provider, tools, max_steps=6):
     """Trả dict: status, answer, trace, usage. Contract chi tiết trong GUIDE.md."""
+    schemas = getattr(tools, 'schemas', SCHEMAS)
+    system_prompt = getattr(tools, 'system_prompt', SYSTEM_PROMPT)
+    policy = BonusPolicy(schemas, question) if hasattr(tools, 'schemas') else None
+    if policy:
+        system_prompt += '\n' + BONUS_GUIDANCE
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": question},
     ]
     trace = []
@@ -59,7 +65,7 @@ def run_agent(question, provider, tools, max_steps=6):
     attempted_incidents = set()
     for step in range(1, max_steps + 1):
         try:
-            response = provider.complete(messages, SCHEMAS)
+            response = provider.complete(messages, schemas)
         except Exception as exc:
             error_type = type(exc).__name__
             trace.append({
@@ -103,6 +109,48 @@ def run_agent(question, provider, tools, max_steps=6):
 
         if finish == "stop" and not calls:
             answer = response["message"].get("content") or ""
+
+            pending_actions = policy.pending_actions() if policy else []
+            if pending_actions:
+                trace.append({
+                    'event': 'validation_pending_bonus_actions',
+                    'step': step,
+                    'actions': pending_actions,
+                })
+                messages.append({
+                    'role': 'system',
+                    'content': (
+                        'Chưa hoàn thành yêu cầu: còn bước lấy chi tiết incident '
+                        'hoặc retry khả dụng đã được yêu cầu nhưng chưa thực hiện. '
+                        'Hãy gọi tools sau: '
+                        + json.dumps(pending_actions, ensure_ascii=False)
+                        + '. Không chỉ nói đang retry mà không gọi tool. '
+                        'Sau khi đọc kết quả, trả lời lại toàn bộ câu hỏi gốc, '
+                        'dẫn URL từng bên và thời điểm snapshot; nếu lỗi tiếp '
+                        'thì tuân thủ retriable/budget và báo phần chưa xác minh.'
+                    ),
+                })
+                continue
+
+            pending_pages = policy.pending_pages() if policy else []
+            if pending_pages:
+                trace.append({
+                    'event': 'validation_unread_pages',
+                    'step': step,
+                    'pages': pending_pages,
+                })
+                messages.append({
+                    'role': 'system',
+                    'content': (
+                        'Câu hỏi cần timeline/ảnh hưởng/nguyên nhân nhưng còn trang '
+                        'chưa đọc. Gọi get_incident_details với tham số trang sau: '
+                        + json.dumps(pending_pages, ensure_ascii=False)
+                        + '. Sau đó trả lời toàn bộ câu hỏi gốc, dẫn nguồn từng bên '
+                        'và phân biệt snapshot, incident lịch sử, nội dung bị cắt. '
+                        'Nếu tool lỗi, báo giới hạn thay vì khẳng định đã đọc hết.'
+                    ),
+                })
+                continue
 
             pending = related_incidents - attempted_incidents
             if follow_links and pending:
@@ -176,7 +224,8 @@ def run_agent(question, provider, tools, max_steps=6):
                         str(arguments.get("incident_id", "")),
                     ))
                 try:
-                    result = tools.execute(call["name"], arguments)
+                    result = (policy.execute(tools, call["name"], arguments)
+                              if policy else tools.execute(call["name"], arguments))
                 except Exception as exc:
                     # Lỗi tool là observation để model có thể báo kết quả từng phần.
                     result = {
@@ -219,10 +268,17 @@ def run_agent(question, provider, tools, max_steps=6):
                 and arguments.get("provider") in ("github", "cloudflare")
             ):
                 failed_status_providers.add(arguments["provider"])
+            observation = policy.observation(result) if policy else result
+            if observation is not result:
+                trace.append({
+                    'event': 'context_compacted',
+                    'step': step,
+                    'omitted_distractors_count': observation['omitted_distractors_count'],
+                })
             messages.append({
                 "role": "tool",
                 "tool_call_id": call["id"],
-                "content": json.dumps(result, ensure_ascii=False),
+                "content": json.dumps(observation, ensure_ascii=False),
             })
         if failed_status_providers:
             trace.append({
